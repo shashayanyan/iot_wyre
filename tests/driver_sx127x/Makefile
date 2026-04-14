@@ -18,6 +18,13 @@ USEMODULE += shell
 USEMODULE += shell_cmds_default
 #USEMODULE += shell_commands
 USEMODULE += fmt
+# new ones
+USEMODULE += xtimer
+USEMODULE += saul_default
+
+
+
+LDFLAGS += -lm
 
 DRIVER ?= sx1272
 # use SX1276 by default
