@@ -66,6 +66,7 @@ static sx127x_t sx127x;
 
 // for autotelem
 static char telemetry_stack[THREAD_STACKSIZE_DEFAULT];
+static char relay_stack[THREAD_STACKSIZE_DEFAULT];
 static uint32_t telemetry_interval = 0; /* 0 means disabled */
 
 #define CHAT_TTL_DEFAULT 7
@@ -144,16 +145,30 @@ static size_t convert_hex(uint8_t *dest, const char *src) {
 }
 
 /*
- * HISTORY
+ * HISTORY & RELAY MANAGEMENT
 */
 
 #define HISTORY_MAX 10  
+#define RELAY_QUEUE_MAX 8
+
+/* Message relay status */
+typedef enum {
+    MSG_STATUS_RECEIVED = 0,    /* Just received, pending relay decision */
+    MSG_STATUS_RELAYED = 1,     /* Successfully relayed */
+    MSG_STATUS_NOT_RELAYED = 2, /* Decided not to relay (SNR threshold exceeded) */
+    MSG_STATUS_DROPPED = 3      /* Dropped due to TTL=0 or other reason */
+} msg_status_t;
 
 typedef struct {
     char sender[NODE_ID_MAXLEN];
     char target[NODE_ID_MAXLEN];
     char type;
     char payload[128];
+    uint16_t msg_id;
+    uint8_t ttl;
+    int8_t snr;                 /* Signal-to-Noise Ratio */
+    msg_status_t status;        /* Relay status */
+    uint32_t timestamp;         /* When message was received (ms) */
 } chat_msg_t;
 
 
@@ -161,13 +176,32 @@ static chat_msg_t msg_history[HISTORY_MAX];
 static uint8_t history_head = 0;  /* Index where the NEXT message will be written */
 static uint8_t history_count = 0; /* How many messages are currently in the queue */
 
-static void add_to_history(const char* sender, char type, const char* target, const char* payload) {
+/* Relay management */
+static int8_t snr_threshold = 0;  /* Default: relay all messages (SNR threshold) */
+
+typedef struct {
+    char raw_msg[255];
+    uint32_t relay_delay_ms;    /* Milliseconds to wait before relaying */
+    uint8_t ttl;
+    int8_t snr;
+    uint32_t queued_at_ms;      /* Timestamp when message was queued */
+} relay_msg_t;
+
+static relay_msg_t relay_queue[RELAY_QUEUE_MAX];
+static uint8_t relay_queue_count = 0;
+
+static void add_to_history(const char* sender, char type, const char* target, const char* payload, uint16_t msg_id, uint8_t ttl, 
+                          int8_t snr, msg_status_t status) {
     /* Copy data into the current head position */
     strncpy(msg_history[history_head].sender, sender, sizeof(msg_history[history_head].sender) - 1);
     msg_history[history_head].type = type;
     strncpy(msg_history[history_head].target, target, sizeof(msg_history[history_head].target) - 1);
     strncpy(msg_history[history_head].payload, payload, sizeof(msg_history[history_head].payload) - 1);
-    
+    msg_history[history_head].msg_id = msg_id;
+    msg_history[history_head].ttl = ttl;
+    msg_history[history_head].snr = snr;
+    msg_history[history_head].status = status;
+    msg_history[history_head].timestamp = xtimer_now_usec() / 1000;  /* Convert to ms */
     /* Ensure null termination */
     msg_history[history_head].sender[NODE_ID_MAXLEN - 1] = '\0';
     msg_history[history_head].target[NODE_ID_MAXLEN - 1] = '\0';
@@ -181,6 +215,81 @@ static void add_to_history(const char* sender, char type, const char* target, co
     }
 }
 
+/* ================================================== *
+ * RELAY DELAY CALCULATION
+ * ================================================== */
+
+/* Calculate relay delay in milliseconds based on SNR and other parameters
+ * Higher SNR = lower priority = longer delay
+ * This implements a back-off mechanism for mesh networking
+ */
+static uint32_t calculate_relay_delay(int8_t snr, uint8_t sf, uint8_t bw) {
+    /* Base delay: time-on-air calculation 
+     * Approximate values for different SF/BW combinations (in ms) */
+    uint32_t base_delay = 100;  /* default 100ms */
+    
+    /* Increase delay based on SF (higher SF = longer transmissions) */
+    if (sf >= 12) base_delay = 200;
+    else if (sf >= 10) base_delay = 150;
+    else if (sf >= 8) base_delay = 120;
+    
+    /* SNR-based priority backoff
+     * If SNR is very good, node waits longer (lower priority to relay)
+     * If SNR is poor, node waits less (higher priority to relay) */
+    uint32_t snr_delay;
+    if (snr >= 10) {
+        snr_delay = 300;  /* Excellent signal: wait 300ms */
+    } else if (snr >= 5) {
+        snr_delay = 200;  /* Good signal: wait 200ms */
+    } else if (snr >= 0) {
+        snr_delay = 100;  /* Decent signal: wait 100ms */
+    } else if (snr >= -10) {
+        snr_delay = 50;   /* Poor signal: wait 50ms */
+    } else {
+        snr_delay = 20;   /* Very poor signal: wait 20ms */
+    }
+    
+    /* Add some randomization to prevent collision storms */
+    snr_delay += (rand() % 50);  /* Add 0-50ms random jitter */
+    
+    return base_delay + snr_delay;
+}
+
+/* Add message to relay queue if it should be relayed */
+static int queue_for_relay(const char *raw_msg, uint8_t ttl, int8_t snr, uint8_t sf, uint8_t bw) {
+    /* Don't relay if TTL is 0 or not present */
+    if (ttl == 0) {
+        return 0;  /* Message end-of-life, don't relay */
+    }
+    
+    /* Check SNR threshold - if signal too strong, don't bother relaying */
+    if (snr > snr_threshold) {
+        printf("[RELAY] SNR %d > threshold %d, skipping relay\n", snr, snr_threshold);
+        return 0;
+    }
+    
+    /* Check if queue is full */
+    if (relay_queue_count >= RELAY_QUEUE_MAX) {
+        printf("[RELAY] Queue full, dropping message\n");
+        return -1;
+    }
+    
+    /* Add to relay queue */
+    relay_msg_t *relay_msg = &relay_queue[relay_queue_count];
+    strncpy(relay_msg->raw_msg, raw_msg, sizeof(relay_msg->raw_msg) - 1);
+    relay_msg->raw_msg[sizeof(relay_msg->raw_msg) - 1] = '\0';
+    relay_msg->relay_delay_ms = calculate_relay_delay(snr, sf, bw);
+    relay_msg->ttl = ttl - 1;  /* Decrement TTL */
+    relay_msg->snr = snr;
+    relay_msg->queued_at_ms = xtimer_now_usec() / 1000;  /* Timestamp in ms */
+    
+    relay_queue_count++;
+    
+    printf("[RELAY] Queued: delay=%lu ms, TTL will be %u\n", 
+           relay_msg->relay_delay_ms, relay_msg->ttl);
+    
+    return 1;  /* Successfully queued */
+}
 
 
 int lora_setup_cmd(int argc, char **argv)
@@ -718,7 +827,7 @@ static void handle_lpp_received(const char *sender, uint16_t msg_id, const char 
     printf("      - And other sensor readings\n");
 }
 
-static void handle_chat_message(char *raw_msg) {
+static void handle_chat_message(char *raw_msg, int8_t snr, uint8_t sf, uint8_t bw) {
     /*
      Copie de travail pour ne pas altérer le buffer original si besoin 
     char chat_buf[255];
@@ -816,7 +925,7 @@ static void handle_chat_message(char *raw_msg) {
     if (!colon2) return;
     *colon2 = '\0';
     
-    uint8_t ttl __attribute__((unused)) = (uint8_t)atoi(after_msg_id);
+    uint8_t ttl = (uint8_t)atoi(after_msg_id);
     char *payload = colon2 + 1;
 
     /* -------------------------------------------------- *
@@ -828,14 +937,24 @@ static void handle_chat_message(char *raw_msg) {
     }
 
     /* -------------------------------------------------- *
-     * Display
+     * Display with SNR and TTL info
      * -------------------------------------------------- */
-    printf("\n₍ᐢ֎ﻌ֍ᐢ₎ʃ [LoRaChat] De: %s | Pour: %c%s | ID: %u\n> %s\n",
-           sender, type, target, msg_id, payload ? payload : "[payload unavailable]");
+    printf("\n₍ᐢ֎ﻌ֍ᐢ₎ʃ [LoRaChat] De: %s | Pour: %c%s | ID: %u | TTL: %u | SNR: %d dB\n> %s\n",
+           sender, type, target, msg_id, ttl, snr, payload ? payload : "[payload unavailable]");
 
-    // HISTORY
-    if (payload != NULL) {
-        add_to_history(sender, type, target, payload);
+     /* -------------------------------------------------- *
+     * Relay Management: Queue message if TTL > 0 and not from us
+     * -------------------------------------------------- */
+    if (strcmp(sender, MY_NODE_ID) != 0) {
+        /* Check if we should relay this message */
+        int relay_result = queue_for_relay(raw_msg, ttl, snr, sf, bw);
+        msg_status_t status = (relay_result > 0) ? MSG_STATUS_RELAYED : 
+                             (relay_result == 0) ? MSG_STATUS_NOT_RELAYED : MSG_STATUS_DROPPED;
+        
+        /* Add to history with relay status */
+        if (payload != NULL) {
+            add_to_history(sender, type, target, payload, msg_id, ttl, snr, status);
+        }
     }
     /* -------------------------------------------------- *
      * Reaction rules (guard: never react to own messages)
@@ -870,301 +989,6 @@ static void handle_chat_message(char *raw_msg) {
         handle_lpp_received(sender, msg_id, payload);
     }
 }
-/*
-static void handle_chat_message(char *raw_msg) {
-    
-     Copie de travail pour ne pas altérer le buffer original si besoin 
-    char chat_buf[255];
-    strncpy(chat_buf, raw_msg, sizeof(chat_buf));
-    chat_buf[254] = '\0';
-
-    char *sender = chat_buf;
-    char *separator = strpbrk(chat_buf, "@#");
-    if (!separator) return;  Ce n'est pas un message LoRaChat valide 
-
-    char type = *separator;  '@' (direct/all) ou '#' (salon) 
-    *separator = '\0';
-    char *target = separator + 1;
-
-    char *colon1 = strchr(target, ':');
-    if (!colon1) return;
-    *colon1 = '\0';
-    char *msg_id_str = colon1 + 1;
-
-    char *colon2 = strchr(msg_id_str, ':');
-    if (!colon2) return;
-    *colon2 = '\0';
-    char *payload = colon2 + 1;
-
-     Affichage formaté ₍ᐢ֎ﻌ֍ᐢ₎ʃ 
-    printf("\n₍ᐢ֎ﻌ֍ᐢ₎ʃ [LoRaChat] De: %s | Pour: %c%s | ID: %s \n> %s\n", 
-           sender, type, target, msg_id_str, payload);
-
-     --- GESTION DES RÉACTIONS --- 
-    
-    Règle 1: "Qui est la?" 
-    if (strcmp(payload, "Qui est la?") == 0) {
-        if (strcmp(sender, MY_NODE_ID) != 0) { // Ne pas se répondre à soi-même
-            printf("[LoRaChat] -> Ping reçu, préparation de la réponse...\n");
-            
-            char reply[255];
-            snprintf(reply, sizeof(reply), "%s@%.16s:%d:Je suis la !", 
-                     MY_NODE_ID, sender, current_msg_id++);
-            
-            iolist_t iolist = { .iol_base = reply, .iol_len = strlen(reply) + 1 };
-            netdev_t *netdev = &sx127x.netdev;
-            netdev->driver->send(netdev, &iolist);
-            printf("[LoRaChat] -> Réponse envoyée: %s\n", reply);
-        }
-    }
-     Règle 2: "RDV" (À implémenter plus tard) 
-    else if (strncmp(payload, "RDV", 3) == 0) {
-        printf("[LoRaChat] -> Ordre de saut de fréquence détecté (non exécuté).\n");
-    }
-        
-
-    char chat_buf[255];
-    strncpy(chat_buf, raw_msg, sizeof(chat_buf) - 1);
-    chat_buf[254] = '\0';
-
-     -------------------------------------------------- 
-     * Parse header: <emitter><type><target>:<ttl>:<id>
-     * New format:   NODE1#salon:7:42|ad:WyreBase|msg:Hello
-     * Legacy format NODE1#salon:42:Hello   (no TTL, no named fields)
-     * -------------------------------------------------- 
-
-    char *sender = chat_buf;
-
-     1. Find type character ('#', '@', '*') — ends the emitter field 
-    char *separator = strpbrk(chat_buf, "@#*");
-    if (!separator) return;
-
-    char type = *separator;
-    *separator = '\0';
-    char *target = separator + 1;
-
-     2. First colon — ends the target, begins ttl-or-id 
-    char *colon1 = strchr(target, ':');
-    if (!colon1) return;
-    *colon1 = '\0';
-    char *after_target = colon1 + 1;
-
-     3. Detect new vs legacy format by checking for a second colon
-     *    before any '|' separator.
-     *    New:    ttl:id|...
-     *    Legacy: id:payload  (no second colon before payload) 
-    char *colon2  = strchr(after_target, ':');
-    char *pipe    = strchr(after_target, '|');
-
-    uint16_t msg_id = 0;
-    char    *payload = NULL;
-
-    if (colon2 && pipe!=NULL) {
-         ---- New protocol ---- 
-        *colon2 = '\0';
-     after_target = ttl string (we read but don't use TTL for display) 
-        uint8_t ttl __attribute__((unused)) = (uint8_t)atoi(after_target);
-
-        char *id_and_rest = colon2 + 1;
-
-         Split on '|' to get the named fields 
-        char *fields = strchr(id_and_rest, '|');
-        if (fields) {
-            *fields = '\0';
-            fields++;    now points to "ad:...|msg:..." 
-        }
-
-        msg_id = (uint16_t)atoi(id_and_rest);
-
-         Extract msg: field 
-        if (fields) {
-            char *msg_field = strstr(fields, "msg:");
-            payload = msg_field ? msg_field + 4 : fields;
-        } else {
-            payload = "";    id only, no payload — still a valid frame 
-        }
-    } else {
-         ---- Legacy protocol: after_target = "id:payload" ---- 
-        if (!colon2) return;
-        *colon2 = '\0';
-        msg_id  = (uint16_t)atoi(after_target);
-        payload = colon2 + 1;
-    }
-
-    -------------------------------------------------- *
-     * Node table — update as soon as we have a valid frame
-     * (do this regardless of whether we display or react)
-     * -------------------------------------------------- 
-    if (sender[0] != '\0') {
-        node_table_update(sender, msg_id);
-    }
-
-    
-     * Filter out salons we're not in
-    
-    if (type == '#' && !is_in_salon(target)) {
-        return;  Not for us 
-    }
-
-    if (type == '@' && target[0] != '\0' && strcmp(target, MY_NODE_ID) != 0) {
-        return; // Not for us
-    }
-
-     -------------------------------------------------- *
-     * Display
-    -------------------------------------------------- 
-    printf("\n₍ᐢ֎ﻌ֍ᐢ₎ʃ [LoRaChat] De: %s | Pour: %c%s | ID: %u\n> %s\n",
-           sender, type, target, msg_id, payload ? payload : "[payload unavailable]");
-
-     -------------------------------------------------- *
-     * Reaction rules (guard: never react to own messages)
-     * -------------------------------------------------- 
-    if (strcmp(sender, MY_NODE_ID) == 0) return;
-
-    if (payload == NULL) return;
-
-     Rule 1: ping 
-    if (strcmp(payload, "Qui est la?") == 0) {
-        printf("[LoRaChat] -> Ping reçu, préparation de la réponse...\n");
-
-        char reply[512];
-        snprintf(reply, sizeof(reply), "%s@%s:%d:%d|msg:Je suis la !",
-                 MY_NODE_ID, sender, CHAT_TTL_DEFAULT, current_msg_id++);
-
-        iolist_t iolist = { .iol_base = reply, .iol_len = strlen(reply) + 1 };
-        netdev_t *netdev = &sx127x.netdev;
-        netdev->driver->send(netdev, &iolist);
-        printf("[LoRaChat] -> Réponse envoyée: %s\n", reply);
-    }
-     Rule 2: frequency hop 
-    else if (strncmp(payload, "RDV", 3) == 0) {
-        printf("[LoRaChat] -> Ordre de saut de fréquence détecté (non exécuté).\n");
-    }
-}
-
-int chat_cmd(int argc, char **argv) {
-    
-    if (argc < 3) {
-        puts("usage: chat <target|#salon> <message...>");
-        puts("ex: chat * Qui est la?");
-        puts("ex: chat #frblabla Salut tout le monde");
-        return -1;
-    }
-
-    char chat_buf[255];
-    char payload[128] = {0};
-    
-    Reconstruire le message à partir des arguments 
-    for(int i = 2; i < argc; i++) {
-        strcat(payload, argv[i]);
-        if(i < argc - 1) strcat(payload, " ");
-    }
-
-    char type = '@';
-    char *target = argv[1] + 1;
-    if (argv[1][0] == '#') {
-        type = '#';
-        //target = argv[1] + 1; Enlever le '#' du nom du salon 
-    }
-
-    snprintf(chat_buf, sizeof(chat_buf), "%s%c%s:%d:%s", 
-             MY_NODE_ID, type, target, current_msg_id++, payload);
-
-    iolist_t iolist = { .iol_base = chat_buf, .iol_len = strlen(chat_buf) + 1 };
-    netdev_t *netdev = &sx127x.netdev;
-
-    if (netdev->driver->send(netdev, &iolist) == -ENOTSUP) {
-        puts("Cannot send: radio is still transmitting");
-    } else {
-        printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ Message envoyé: %s\n", chat_buf);
-    }
-
-    return 0;
-    
-
-    if (argc < 3) {
-        puts("usage: chat <#salon|@peer|*> <message...> [ttl=N] [ad=text]");
-        puts("  ex:  chat #frblabla Salut tout le monde");
-        puts("  ex:  chat @node42   Hello ttl=3");
-        puts("  ex:  chat *         Qui est la? ad=WyreBase-v1.2");
-        return -1;
-    }
-
-     --- Parse optional keyword args embedded at end of argv --- 
-    int ttl = CHAT_TTL_DEFAULT;
-    char advertisement[64] = {0};
-    char payload[128]       = {0};
-
-    for (int i = 2; i < argc; i++) {
-        if (strncmp(argv[i], "ttl=", 4) == 0) {
-            ttl = atoi(argv[i] + 4);
-            if (ttl <= 0 || ttl > 255) ttl = CHAT_TTL_DEFAULT;
-        } else if (strncmp(argv[i], "ad=", 3) == 0) {
-            strncpy(advertisement, argv[i] + 3, sizeof(advertisement) - 1);
-        } else {
-            if (payload[0]) strncat(payload, " ", sizeof(payload) - strlen(payload) - 1);
-            strncat(payload, argv[i], sizeof(payload) - strlen(payload) - 1);
-        }
-    }
-
-     --- Determine target type and name --- 
-    char*  type;
-    char *target;
-
-    if (argv[1][0] == '#') {
-        type   = "#\0";
-        target = argv[1] + 1;            strip '#' 
-    } else if (argv[1][0] == '@') {
-        type   = "@\0";
-        target = argv[1] + 1;           strip '@' 
-    } else if (argv[1][0] == '*') {
-        type   = "@*\0";
-        target = "";                     broadcast 
-    } else {
-        puts("error: target must start with #, @, or *");
-        return -1;
-    }
-
-    if (strcmp(type, "#") == 0 && !is_in_salon(target)){
-        printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ [Erreur] Cannot send: You are not a member of salon #%s. Use 'join %s' first.\n", target, target);
-        return -1; // drop message
-    }
-
-     --- Build frame ---
-      Format: <emitter><type><target>:<ttl>:<msg_id>:ad=<ad>:msg=<payload>
-     Example: NODE1#frblabla:7:42|ad:WyreBase-v1.2|msg:Salut tout le monde
-     
-    char chat_buf[CHAT_BUF_SIZE];
-    int len = snprintf(chat_buf, sizeof(chat_buf),
-                       "%s%s%s:%d,%d:" CHAT_MSG_FIELD "%s",
-                       MY_NODE_ID,
-                       type,
-                       target,
-                       current_msg_id++,
-                       ttl,
-                       payload);
-
-    if (len < 0 || len >= (int)sizeof(chat_buf)) {
-        puts("error: message too long");
-        return -1;
-    }
-
-     --- Send --- 
-    iolist_t iolist = { .iol_base = chat_buf, .iol_len = (size_t)len + 1 };
-    netdev_t *netdev = &sx127x.netdev;
-
-    if (netdev->driver->send(netdev, &iolist) == -ENOTSUP) {
-        puts("error: radio still transmitting");
-        return -1;
-    }
-
-    printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ sent [ttl=%d id=%d]: %s\n",
-           ttl, current_msg_id - 1, chat_buf);
-    return 0;
-
-
-}
-*/
 
 int chat_cmd(int argc, char **argv) {
     if (argc < 3) {
@@ -1429,8 +1253,14 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             }
             printf("\n--------------------------------\n");
 
-            /* Appel de notre analyseur LoRaChat qui ignorera les messages binaires */
-            handle_chat_message(message);
+            /* Get current LoRa parameters for relay delay calculation */
+            uint8_t sf = 7, bw = LORA_BW_125_KHZ;
+            netdev_t *netdev = dev;
+            netdev->driver->get(netdev, NETOPT_SPREADING_FACTOR, &sf, sizeof(sf));
+            netdev->driver->get(netdev, NETOPT_BANDWIDTH, &bw, sizeof(bw));
+
+            /* Appel de notre analyseur LoRaChat avec SNR, SF, BW pour relay management */
+            handle_chat_message(message, (int8_t)packet_info.snr, sf, bw);
             break;
 
         case NETDEV_EVENT_TX_COMPLETE:
@@ -1530,6 +1360,104 @@ void *_telemetry_thread(void *arg) {
     return NULL;
 }
 
+void *_relay_thread(void *arg) {
+    /* Thread that processes relay queue - waits for delay then resends messages */
+    (void)arg;
+    
+    while (1) {
+        /* Check relay queue every 50ms */
+        xtimer_usleep(50 * 1000);  /* 50ms = 50000 microseconds */
+        
+        if (relay_queue_count == 0) {
+            continue;  /* Nothing to do */
+        }
+        
+        uint32_t now_ms = xtimer_now_usec() / 1000;
+        int i = 0;
+        
+        /* Process all messages in queue */
+        while (i < relay_queue_count) {
+            relay_msg_t *msg = &relay_queue[i];
+            uint32_t time_elapsed = now_ms - msg->queued_at_ms;
+            
+            /* Check if delay has expired */
+            if (time_elapsed >= msg->relay_delay_ms) {
+                printf("[RELAY] Delay expired (waited %lu ms), resending with TTL=%u\n", 
+                       time_elapsed, msg->ttl);
+                
+                /* Reconstruct message with new TTL */
+                char modified_msg[255];
+                char msg_copy[255];
+                strncpy(msg_copy, msg->raw_msg, sizeof(msg_copy) - 1);
+                msg_copy[sizeof(msg_copy) - 1] = '\0';
+                
+                /* Parse and rebuild with new TTL
+                 * Format: <emitter><type><target>:<msg_id>,<ttl>:<payload>
+                 * We need to find and replace the TTL field */
+                char *sender = msg_copy;
+                char *separator = strpbrk(msg_copy, "@#*");
+                if (separator) {
+                    char type = *separator;
+                    *separator = '\0';
+                    char *target = separator + 1;
+                    
+                    char *colon1 = strchr(target, ':');
+                    if (colon1) {
+                        *colon1 = '\0';
+                        char *after_target = colon1 + 1;
+                        
+                        char *comma = strchr(after_target, ',');
+                        if (comma) {
+                            *comma = '\0';
+                            uint16_t msg_id = (uint16_t)atoi(after_target);
+                            
+                            char *colon2 = strchr(comma + 1, ':');
+                            if (colon2) {
+                                char *payload = colon2 + 1;
+                                
+                                /* Build new message with decremented TTL */
+                                int len = snprintf(modified_msg, sizeof(modified_msg),
+                                                 "%s%c%s:%u,%u:%s",
+                                                 sender, type, target, msg_id, msg->ttl, payload);
+                                
+                                if (len > 0 && len < (int)sizeof(modified_msg)) {
+                                    /* Send the relayed message */
+                                    iolist_t iolist = { 
+                                        .iol_base = modified_msg, 
+                                        .iol_len = (size_t)len + 1 
+                                    };
+                                    netdev_t *netdev = &sx127x.netdev;
+                                    
+                                    if (netdev->driver->send(netdev, &iolist) != -ENOTSUP) {
+                                        printf("[RELAY] ✓ Relayed message from %s (TTL: %u)\n", sender, msg->ttl);
+                                    } else {
+                                        printf("[RELAY] ✗ Send failed (radio busy)\n");
+                                        i++;  /* Skip to next, retry later would need timer */
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                /* Remove from queue by shifting everything down */
+                for (int j = i; j < relay_queue_count - 1; j++) {
+                    relay_queue[j] = relay_queue[j + 1];
+                }
+                relay_queue_count--;
+                
+                /* Don't increment i, check same position again (now has next message) */
+            } else {
+                i++;  /* Move to next message */
+            }
+        }
+    }
+    
+    return NULL;
+}
+
+
 int autotelm_cmd(int argc, char **argv) {
     if (argc < 2) {
         puts("usage: autotelm <seconds>");
@@ -1588,6 +1516,17 @@ int init_sx1272_cmd(int argc, char **argv)
 
         if (_telm_pid <= KERNEL_PID_UNDEF) {
             puts("Creation of telemetry thread failed");
+            return 1;
+        }
+
+         // for relay queue processing
+        kernel_pid_t _relay_pid = thread_create(relay_stack, sizeof(relay_stack),
+                                  THREAD_PRIORITY_MAIN - 2,
+                                  THREAD_CREATE_STACKTEST, _relay_thread, NULL,
+                                  "relay_thread");
+
+        if (_relay_pid <= KERNEL_PID_UNDEF) {
+            puts("Creation of relay thread failed");
             return 1;
         }
 
@@ -1716,17 +1655,106 @@ int history_cmd(int argc, char **argv) {
     int index = (history_head - history_count + HISTORY_MAX) % HISTORY_MAX;
 
     for (int i = 0; i < history_count; i++) {
-        printf("[%d] From: %s -> %c%s : %s\n", 
+         const char *status_str;
+        switch (msg_history[index].status) {
+            case MSG_STATUS_RELAYED:
+                status_str = "✓RELAYED";
+                break;
+            case MSG_STATUS_NOT_RELAYED:
+                status_str = "✗NO_RELAY";
+                break;
+            case MSG_STATUS_DROPPED:
+                status_str = "⊘DROP";
+                break;
+            default:
+                status_str = "?UNKNOWN";
+        }
+        
+        printf("[%d] From: %s->%c%s | ID:%u | TTL:%u | SNR:%d dB | %s\n", 
             i + 1,
             msg_history[index].sender, 
             msg_history[index].type, 
-            msg_history[index].target, 
-            msg_history[index].payload);
+            msg_history[index].target,
+            msg_history[index].msg_id,
+            msg_history[index].ttl,
+            msg_history[index].snr,
+            status_str);
+        printf("     Payload: %s\n", msg_history[index].payload);
         
         index = (index + 1) % HISTORY_MAX;
     }
     
     puts("-------------------------");
+    return 0;
+}
+
+int snr_threshold_cmd(int argc, char **argv) {
+    /* Get/Set SNR threshold for relay filtering
+     * usage: snr_threshold [get|set <value>]
+     * If SNR of received message is ABOVE this threshold, node won't relay
+     */
+    if (argc < 2) {
+        puts("usage: snr_threshold <get|set <value>>");
+        puts("  snr_threshold get        - Show current SNR threshold");
+        puts("  snr_threshold set <dB>   - Set threshold (higher SNR = relay skip)");
+        puts("  Example: snr_threshold set 5  (skip relay if SNR > 5 dB)");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "get") == 0) {
+        printf("Current SNR threshold: %d dB\n", snr_threshold);
+        printf("Messages with SNR > %d dB will NOT be relayed\n", snr_threshold);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            puts("usage: snr_threshold set <value_in_dB>");
+            return -1;
+        }
+
+        int new_threshold = atoi(argv[2]);
+        
+        /* Reasonable SNR range for LoRa (roughly -20 to +20 dB) */
+        if (new_threshold < -30 || new_threshold > 30) {
+            printf("Warning: threshold %d dB is outside typical LoRa SNR range\n", new_threshold);
+        }
+
+        snr_threshold = (int8_t)new_threshold;
+        printf("SNR threshold set to %d dB\n", snr_threshold);
+        printf("Messages with SNR > %d dB will be skipped (sender had good signal)\n", snr_threshold);
+        return 0;
+    }
+
+    puts("Unknown command. usage: snr_threshold <get|set <value>>");
+    return -1;
+}
+
+int relayq_cmd(int argc, char **argv) {
+    /* Display relay queue status - messages pending relay */
+    (void)argc;
+    (void)argv;
+
+    printf("\n=== RELAY QUEUE STATUS ===\n");
+    printf("Queue size: %u/%u messages pending\n", relay_queue_count, RELAY_QUEUE_MAX);
+
+    if (relay_queue_count == 0) {
+        puts("No messages in relay queue");
+        return 0;
+    }
+
+    puts("\nPending relay messages:");
+    for (uint8_t i = 0; i < relay_queue_count; i++) {
+        relay_msg_t *msg = &relay_queue[i];
+        printf("[%u] Delay: %lu ms | TTL→%u | SNR: %d dB\n", 
+               i + 1, msg->relay_delay_ms, msg->ttl, msg->snr);
+        printf("     Raw: %s\n", msg->raw_msg);
+    }
+
+    printf("\n=== RELAY SETTINGS ===\n");
+    printf("SNR Threshold: %d dB (skip relay if SNR > threshold)\n", snr_threshold);
+    printf("Max queue size: %u messages\n", RELAY_QUEUE_MAX);
+
     return 0;
 }
 
@@ -1754,6 +1782,8 @@ static const shell_command_t shell_commands[] = {
     { "salons",   "List joined salons",                     salons_cmd },
     { "autotelm",   "Set auto telemetry interval (0 to stop)", autotelm_cmd },
     { "history",    "Show last received messages (FIFO)",      history_cmd },
+    { "snr_threshold", "Get/Set SNR threshold for relay",     snr_threshold_cmd },
+    { "relayq",   "Show relay queue status and settings",   relayq_cmd },
     { NULL, NULL, NULL }
 };
 
