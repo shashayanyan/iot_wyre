@@ -47,6 +47,30 @@
 #include "saul_reg.h"
 #include "xtimer.h"
 
+/* EEPROM persistence support for STM32L151CC */
+#include <stdint.h>
+#define EEPROM_START_ADDR   0x08080000  /* STM32L151CC EEPROM base address */
+#define EEPROM_SIZE         4096        /* 4 KB EEPROM */
+
+/* EEPROM layout:
+ * [0-3]     : Magic number (0xDEADBEEF)
+ * [4]       : Version/status byte
+ * [5]       : CRC8 checksum
+ * [6-1000]  : Node table (16 nodes × 62 bytes each)
+ * [1001]    : Active salon count
+ * [1002-1200]: Salon entries (5 salons × 33 bytes each)
+ */
+#define EEPROM_MAGIC        0xDEADBEEF
+#define EEPROM_VERSION      0x01
+#define EEPROM_MAGIC_OFFSET 0
+#define EEPROM_VERSION_OFFSET 4
+#define EEPROM_CRC_OFFSET   5
+#define EEPROM_NODES_OFFSET 6
+#define EEPROM_NODES_SIZE   (16 * 62)   /* 16 nodes × 62 bytes */
+#define EEPROM_SALONS_COUNT_OFFSET 1001
+#define EEPROM_SALONS_OFFSET 1002
+#define EEPROM_SALONS_SIZE  (5 * 33)    /* 5 salons × 33 bytes */
+
 
 #define SX127X_LORA_MSG_QUEUE   (16U)
 #ifndef SX127X_STACKSIZE
@@ -90,6 +114,7 @@ known_node_t node_table[NODE_TABLE_SIZE] = {0};
 void node_table_update(const char *emitter_id, uint16_t msg_id)
 {
     int free_slot = -1;
+    int is_new_node = 0;
 
     for (int i = 0; i < NODE_TABLE_SIZE; i++) {
         if (!node_table[i].active) {
@@ -112,6 +137,12 @@ void node_table_update(const char *emitter_id, uint16_t msg_id)
     node_table[free_slot].node_id[NODE_ID_MAXLEN - 1] = '\0';
     node_table[free_slot].last_msg_id = msg_id;
     node_table[free_slot].active      = 1;
+    is_new_node = 1;
+    
+    /* Auto-save new contact to EEPROM */
+    if (is_new_node) {
+        eeprom_save_contacts();
+    }
 }
 
 #define MAX_SALONS         5
@@ -123,6 +154,249 @@ typedef struct {
 } salon_t;
 
 static salon_t my_salons[MAX_SALONS] = {0};
+
+/* ================================================== *
+ * EEPROM HELPER FUNCTIONS
+ * ================================================== */
+
+/* Simple CRC8 checksum for data integrity */
+static uint8_t crc8_checksum(const uint8_t *data, size_t len) {
+    uint8_t crc = 0xAA;  /* Initial value */
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x80) {
+                crc = (crc << 1) ^ 0x07;  /* Polynomial 0x07 */
+            } else {
+                crc = crc << 1;
+            }
+        }
+    }
+    return crc;
+}
+
+/* Read from EEPROM (memory-mapped on STM32L151CC) */
+static void eeprom_read(uint16_t offset, uint8_t *data, size_t len) {
+    uint32_t addr = EEPROM_START_ADDR + offset;
+    for (size_t i = 0; i < len; i++) {
+        data[i] = *((volatile uint8_t*)(addr + i));
+    }
+}
+
+/* Write to EEPROM (memory-mapped on STM32L151CC) */
+static void eeprom_write(uint16_t offset, const uint8_t *data, size_t len) {
+    uint32_t addr = EEPROM_START_ADDR + offset;
+    for (size_t i = 0; i < len; i++) {
+        *((volatile uint8_t*)(addr + i)) = data[i];
+    }
+}
+
+/* Check if EEPROM has valid header */
+static int eeprom_is_valid(void) {
+    uint8_t header[6];
+    eeprom_read(EEPROM_MAGIC_OFFSET, header, 6);
+    
+    uint32_t magic = ((uint32_t)header[0]) | 
+                     (((uint32_t)header[1]) << 8) |
+                     (((uint32_t)header[2]) << 16) |
+                     (((uint32_t)header[3]) << 24);
+    
+    if (magic != EEPROM_MAGIC) {
+        return 0;
+    }
+    if (header[4] != EEPROM_VERSION) {
+        return 0;
+    }
+    
+    return 1;
+}
+
+/* Initialize EEPROM header */
+static void eeprom_init_header(void) {
+    uint8_t header[6] = {0};
+    
+    /* Write magic number (little-endian) */
+    header[0] = EEPROM_MAGIC & 0xFF;
+    header[1] = (EEPROM_MAGIC >> 8) & 0xFF;
+    header[2] = (EEPROM_MAGIC >> 16) & 0xFF;
+    header[3] = (EEPROM_MAGIC >> 24) & 0xFF;
+    header[4] = EEPROM_VERSION;
+    
+    /* Calculate CRC for nodes and salons data */
+    uint8_t payload[EEPROM_NODES_SIZE + 1 + EEPROM_SALONS_SIZE];
+    eeprom_read(EEPROM_NODES_OFFSET, payload, sizeof(payload));
+    header[5] = crc8_checksum(payload, sizeof(payload));
+    
+    eeprom_write(EEPROM_MAGIC_OFFSET, header, 6);
+    printf("[EEPROM] Header initialized at 0x%08lx\n", EEPROM_START_ADDR);
+}
+
+/* Save all contacts (node table) to EEPROM */
+static int eeprom_save_contacts(void) {
+    uint8_t buffer[EEPROM_NODES_SIZE] = {0};
+    size_t offset = 0;
+    
+    /* Serialize node table */
+    for (int i = 0; i < NODE_TABLE_SIZE; i++) {
+        /* Node ID (32 bytes) */
+        memcpy(&buffer[offset], node_table[i].node_id, NODE_ID_MAXLEN);
+        offset += NODE_ID_MAXLEN;
+        
+        /* Last msg ID (2 bytes, little-endian) */
+        buffer[offset++] = node_table[i].last_msg_id & 0xFF;
+        buffer[offset++] = (node_table[i].last_msg_id >> 8) & 0xFF;
+        
+        /* Timestamp (4 bytes, little-endian) - use current time */
+        uint32_t timestamp = xtimer_now_usec() / 1000000;  /* seconds */
+        buffer[offset++] = timestamp & 0xFF;
+        buffer[offset++] = (timestamp >> 8) & 0xFF;
+        buffer[offset++] = (timestamp >> 16) & 0xFF;
+        buffer[offset++] = (timestamp >> 24) & 0xFF;
+        
+        /* Active flag (1 byte) */
+        buffer[offset++] = node_table[i].active;
+    }
+    
+    /* Write to EEPROM */
+    eeprom_write(EEPROM_NODES_OFFSET, buffer, offset);
+    printf("[EEPROM] Saved %d contacts\n", NODE_TABLE_SIZE);
+    
+    /* Update header CRC */
+    eeprom_init_header();
+    
+    return 0;
+}
+
+/* Load all contacts from EEPROM */
+static int eeprom_load_contacts(void) {
+    if (!eeprom_is_valid()) {
+        puts("[EEPROM] Invalid/uninitialized EEPROM, skipping contact load");
+        return -1;
+    }
+    
+    uint8_t buffer[EEPROM_NODES_SIZE];
+    eeprom_read(EEPROM_NODES_OFFSET, buffer, sizeof(buffer));
+    
+    size_t offset = 0;
+    int loaded = 0;
+    
+    /* Deserialize node table */
+    for (int i = 0; i < NODE_TABLE_SIZE; i++) {
+        /* Node ID */
+        memcpy(node_table[i].node_id, &buffer[offset], NODE_ID_MAXLEN);
+        offset += NODE_ID_MAXLEN;
+        
+        /* Last msg ID */
+        node_table[i].last_msg_id = buffer[offset] | (buffer[offset+1] << 8);
+        offset += 2;
+        
+        /* Timestamp (skip for now, just read past it) */
+        offset += 4;
+        
+        /* Active flag */
+        node_table[i].active = buffer[offset++];
+        
+        if (node_table[i].active) {
+            loaded++;
+        }
+    }
+    
+    printf("[EEPROM] Loaded %d contacts from EEPROM\n", loaded);
+    return loaded;
+}
+
+/* Save salon subscriptions to EEPROM */
+static int eeprom_save_salons(void) {
+    uint8_t buffer[EEPROM_SALONS_SIZE + 1] = {0};
+    size_t offset = 0;
+    int count = 0;
+    
+    /* Count active salons */
+    for (int i = 0; i < MAX_SALONS; i++) {
+        if (my_salons[i].active) count++;
+    }
+    
+    /* Write count */
+    buffer[offset++] = (uint8_t)count;
+    
+    /* Serialize salon table */
+    for (int i = 0; i < MAX_SALONS; i++) {
+        if (my_salons[i].active) {
+            /* Salon name (32 bytes) */
+            memcpy(&buffer[offset], my_salons[i].name, SALON_NAME_MAXLEN);
+            offset += SALON_NAME_MAXLEN;
+            
+            /* Active flag (1 byte) */
+            buffer[offset++] = my_salons[i].active;
+        }
+    }
+    
+    /* Write to EEPROM */
+    eeprom_write(EEPROM_SALONS_COUNT_OFFSET, buffer, offset);
+    printf("[EEPROM] Saved %d salons\n", count);
+    
+    /* Update header CRC */
+    eeprom_init_header();
+    
+    return 0;
+}
+
+/* Load salon subscriptions from EEPROM */
+static int eeprom_load_salons(void) {
+    if (!eeprom_is_valid()) {
+        puts("[EEPROM] Invalid/uninitialized EEPROM, skipping salon load");
+        return -1;
+    }
+    
+    uint8_t count_byte;
+    eeprom_read(EEPROM_SALONS_COUNT_OFFSET, &count_byte, 1);
+    int count = (int)count_byte;
+    
+    if (count <= 0 || count > MAX_SALONS) {
+        printf("[EEPROM] No salons saved (count=%d)\n", count);
+        return 0;
+    }
+    
+    uint8_t buffer[EEPROM_SALONS_SIZE];
+    eeprom_read(EEPROM_SALONS_COUNT_OFFSET + 1, buffer, sizeof(buffer));
+    
+    size_t offset = 0;
+    int loaded = 0;
+    
+    /* Deserialize salon table */
+    for (int i = 0; i < count && i < MAX_SALONS; i++) {
+        /* Salon name */
+        memcpy(my_salons[i].name, &buffer[offset], SALON_NAME_MAXLEN);
+        offset += SALON_NAME_MAXLEN;
+        
+        /* Active flag */
+        my_salons[i].active = buffer[offset++];
+        
+        if (my_salons[i].active) {
+            loaded++;
+        }
+    }
+    
+    printf("[EEPROM] Loaded %d salons from EEPROM\n", loaded);
+    return loaded;
+}
+
+/* Clear all EEPROM data */
+static int eeprom_clear(void) {
+    uint8_t zero_block[256] = {0};
+    
+    /* Zero out all EEPROM regions */
+    for (uint16_t addr = 0; addr < EEPROM_SIZE; addr += 256) {
+        eeprom_write(addr, zero_block, 256);
+    }
+    
+    /* Clear RAM tables */
+    memset(node_table, 0, sizeof(node_table));
+    memset(my_salons, 0, sizeof(my_salons));
+    
+    printf("[EEPROM] Cleared all data (%d bytes)\n", EEPROM_SIZE);
+    return 0;
+}
 
 static int is_in_salon(const char *salon_name) {
     for (int i = 0; i < MAX_SALONS; i++) {
@@ -1534,6 +1808,11 @@ int init_sx1272_cmd(int argc, char **argv)
             return 1;
         }
 
+        /* Auto-load persisted data from EEPROM */
+        puts("\n[EEPROM] Loading persisted data...");
+        eeprom_load_contacts();
+        eeprom_load_salons();
+
         puts("5");
 
         return 0;
@@ -1592,6 +1871,10 @@ int join_cmd(int argc, char **argv) {
             my_salons[i].name[SALON_NAME_MAXLEN - 1] = '\0';
             my_salons[i].active = 1;
             printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ Joined salon: #%s\n", my_salons[i].name);
+            
+            /* Auto-save salon to EEPROM */
+            eeprom_save_salons();
+            
             return 0;
         }
     }
@@ -1616,6 +1899,10 @@ int leave_cmd(int argc, char **argv) {
             strncmp(my_salons[i].name, s_name, SALON_NAME_MAXLEN) == 0) {
             my_salons[i].active = 0;
             printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ Left salon: #%s\n", s_name);
+            
+            /* Auto-save salon change to EEPROM */
+            eeprom_save_salons();
+            
             return 0;
         }
     }
@@ -1762,6 +2049,96 @@ int relayq_cmd(int argc, char **argv) {
     return 0;
 }
 
+int persist_cmd(int argc, char **argv) {
+    /* Manage EEPROM persistence for contacts and salons */
+    if (argc < 2) {
+        puts("usage: persist <load|save|clear|status>");
+        puts("  persist load    - Load contacts and salons from EEPROM");
+        puts("  persist save    - Save contacts and salons to EEPROM");
+        puts("  persist clear   - Erase all EEPROM data");
+        puts("  persist status  - Show EEPROM status and contents");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "load") == 0) {
+        printf("\n[EEPROM] Loading from 0x%08lx...\n", EEPROM_START_ADDR);
+        int contacts_loaded = eeprom_load_contacts();
+        int salons_loaded = eeprom_load_salons();
+        printf("[EEPROM] Load complete: %d contacts, %d salons\n", contacts_loaded, salons_loaded);
+        return 0;
+    }
+    else if (strcmp(argv[1], "save") == 0) {
+        printf("\n[EEPROM] Saving to 0x%08lx...\n", EEPROM_START_ADDR);
+        eeprom_save_contacts();
+        eeprom_save_salons();
+        printf("[EEPROM] Save complete\n");
+        return 0;
+    }
+    else if (strcmp(argv[1], "clear") == 0) {
+        puts("[WARNING] Clearing EEPROM...");
+        eeprom_clear();
+        puts("[EEPROM] All data cleared");
+        return 0;
+    }
+    else if (strcmp(argv[1], "status") == 0) {
+        printf("\n=== EEPROM STATUS ===\n");
+        printf("Address: 0x%08lx\n", EEPROM_START_ADDR);
+        printf("Size: %u bytes\n", EEPROM_SIZE);
+        printf("Valid: %s\n", eeprom_is_valid() ? "YES" : "NO");
+        
+        printf("\n=== STORED CONTACTS ===\n");
+        uint8_t node_buffer[EEPROM_NODES_SIZE];
+        eeprom_read(EEPROM_NODES_OFFSET, node_buffer, sizeof(node_buffer));
+        
+        int count = 0;
+        for (int i = 0; i < NODE_TABLE_SIZE; i++) {
+            size_t offset = i * 62;
+            if (node_buffer[offset + 61] == 1) {  /* active flag */
+                char node_id[NODE_ID_MAXLEN];
+                memcpy(node_id, &node_buffer[offset], NODE_ID_MAXLEN);
+                node_id[NODE_ID_MAXLEN-1] = '\0';
+                uint16_t msg_id = node_buffer[offset + 32] | (node_buffer[offset + 33] << 8);
+                printf("  [%d] %s (last msg: %u)\n", ++count, node_id, msg_id);
+            }
+        }
+        if (count == 0) puts("  (none)");
+        
+        printf("\n=== STORED SALONS ===\n");
+        uint8_t salon_count_byte;
+        eeprom_read(EEPROM_SALONS_COUNT_OFFSET, &salon_count_byte, 1);
+        int salon_count = (int)salon_count_byte;
+        
+        if (salon_count > 0 && salon_count <= MAX_SALONS) {
+            uint8_t salon_buffer[EEPROM_SALONS_SIZE];
+            eeprom_read(EEPROM_SALONS_COUNT_OFFSET + 1, salon_buffer, sizeof(salon_buffer));
+            
+            int loaded = 0;
+            for (int i = 0; i < salon_count; i++) {
+                size_t offset = i * 33;
+                char salon_name[SALON_NAME_MAXLEN];
+                memcpy(salon_name, &salon_buffer[offset], SALON_NAME_MAXLEN);
+                salon_name[SALON_NAME_MAXLEN-1] = '\0';
+                if (salon_buffer[offset + 32] == 1) {  /* active flag */
+                    printf("  [%d] #%s\n", ++loaded, salon_name);
+                }
+            }
+        } else {
+            puts("  (none)");
+        }
+        
+        printf("\n=== MEMORY USAGE ===\n");
+        printf("Nodes: %u/%u slots used\n", count, NODE_TABLE_SIZE);
+        printf("Salons: %u/%u slots used\n", salon_count, MAX_SALONS);
+        printf("EEPROM used: ~%u bytes\n", 6 + EEPROM_NODES_SIZE + 1 + EEPROM_SALONS_SIZE);
+        printf("EEPROM free: ~%u bytes\n", EEPROM_SIZE - 6 - EEPROM_NODES_SIZE - 1 - EEPROM_SALONS_SIZE);
+        
+        return 0;
+    }
+    
+    puts("Unknown command. Usage: persist <load|save|clear|status>");
+    return -1;
+}
+
 
 static const shell_command_t shell_commands[] = {
 	{ "init",    "Initialize SX1272",     					init_sx1272_cmd },
@@ -1788,6 +2165,7 @@ static const shell_command_t shell_commands[] = {
     { "history",    "Show last received messages (FIFO)",      history_cmd },
     { "snr_threshold", "Get/Set SNR threshold for relay",     snr_threshold_cmd },
     { "relayq",   "Show relay queue status and settings",   relayq_cmd },
+    { "persist",  "Manage EEPROM persistence (load/save/clear/status)", persist_cmd },
     { NULL, NULL, NULL }
 };
 
