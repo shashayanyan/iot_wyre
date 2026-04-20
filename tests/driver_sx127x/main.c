@@ -865,7 +865,7 @@ static void handle_sos_received(const char *sender, uint16_t msg_id, const char 
         return;
     }
 
-    printf("\n🆘 [SOS] **DISTRESS SIGNAL** from node %s (msg %u)\n", sender, msg_id);
+    printf("\n [SOS] **DISTRESS SIGNAL** from node %s (msg %u)\n", sender, msg_id);
     printf("    Position: LAT=%.5f, LON=%.5f\n", latitude, longitude);
     printf("    *** URGENT: Node %s requires ASSISTANCE ***\n", sender);
     printf("    Location: https://maps.google.com/?q=%.5f,%.5f\n", latitude, longitude);
@@ -1344,20 +1344,20 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
         case NETDEV_EVENT_RX_COMPLETE:
             len = dev->driver->recv(dev, NULL, 0, 0);
             dev->driver->recv(dev, message, len, &packet_info);
-            
+            /*
             printf("\n--- Nouveau Paquet (%d bytes) ---\n", (int)len);
             printf("RSSI: %i, SNR: %i, TOA: %" PRIu32 " ms\n", 
                    packet_info.rssi, (int)packet_info.snr, 
                    sx127x_get_time_on_air((const sx127x_t *)dev, len));
             
-            /* 1. Affichage Hexadécimal (toujours fiable) */
+            / 1. Affichage Hexadécimal (toujours fiable) /
             printf("HEX: ");
             for(size_t i = 0; i < len; i++) {
                 printf("%02X ", (unsigned char)message[i]);
             }
             printf("\n");
 
-            /* 2. Affichage Texte sécurisé (remplace les caractères non-imprimables par un point) */
+            / 2. Affichage Texte sécurisé (remplace les caractères non-imprimables par un point) /
             printf("TXT: ");
             for(size_t i = 0; i < len; i++) {
                 unsigned char c = message[i];
@@ -1368,7 +1368,7 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
                 }
             }
             printf("\n--------------------------------\n");
-
+            */
             /* Get current LoRa parameters for relay delay calculation */
             uint8_t sf = 7, bw = LORA_BW_125_KHZ;
             netdev_t *netdev = dev;
@@ -1548,9 +1548,9 @@ void *_relay_thread(void *arg) {
                                     netdev_t *netdev = &sx127x.netdev;
                                     
                                     if (netdev->driver->send(netdev, &iolist) != -ENOTSUP) {
-                                        printf("[RELAY] ✓ Relayed message from %s (TTL: %u)\n", sender, msg->ttl);
+                                        printf("[RELAY] Relayed message from %s (TTL: %u)\n", sender, msg->ttl);
                                     } else {
-                                        printf("[RELAY] ✗ Send failed (radio busy)\n");
+                                        printf("[RELAY] Send failed (radio busy)\n");
                                         i++;  /* Skip to next, retry later would need timer */
                                         continue;
                                     }
