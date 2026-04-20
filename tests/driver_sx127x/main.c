@@ -50,7 +50,7 @@
 
 #define SX127X_LORA_MSG_QUEUE   (16U)
 #ifndef SX127X_STACKSIZE
-#define SX127X_STACKSIZE        (THREAD_STACKSIZE_DEFAULT)
+#define SX127X_STACKSIZE        (THREAD_STACKSIZE_DEFAULT + 1024)
 #endif
 
 #define MSG_TYPE_ISR            (0x3456)
@@ -65,8 +65,8 @@ static int current_msg_id = 1;
 static sx127x_t sx127x;
 
 // for autotelem
-static char telemetry_stack[THREAD_STACKSIZE_DEFAULT];
-static char relay_stack[THREAD_STACKSIZE_DEFAULT];
+static char telemetry_stack[THREAD_STACKSIZE_DEFAULT + 512];
+static char relay_stack[THREAD_STACKSIZE_DEFAULT + 1024];
 static uint32_t telemetry_interval = 0; /* 0 means disabled */
 
 #define CHAT_TTL_DEFAULT 7
@@ -133,6 +133,12 @@ static int is_in_salon(const char *salon_name) {
     }
     return 0;
 }
+
+/* Pending RDV State */
+static uint32_t pending_rdv_freq = 0;
+static uint8_t pending_rdv_sf = 0;
+static uint8_t pending_rdv_bw = 0;
+static int pending_rdv_valid = 0;
 
 static size_t convert_hex(uint8_t *dest, const char *src) {
     size_t i;
@@ -223,7 +229,7 @@ static void add_to_history(const char* sender, char type, const char* target, co
  * Higher SNR = lower priority = longer delay
  * This implements a back-off mechanism for mesh networking
  */
-static uint32_t calculate_relay_delay(int8_t snr, uint8_t sf, uint8_t bw) {
+static uint32_t calculate_relay_delay(int8_t snr, uint8_t sf) {
     /* Base delay: time-on-air calculation 
      * Approximate values for different SF/BW combinations (in ms) */
     uint32_t base_delay = 100;  /* default 100ms */
@@ -256,7 +262,7 @@ static uint32_t calculate_relay_delay(int8_t snr, uint8_t sf, uint8_t bw) {
 }
 
 /* Add message to relay queue if it should be relayed */
-static int queue_for_relay(const char *raw_msg, uint8_t ttl, int8_t snr, uint8_t sf, uint8_t bw) {
+static int queue_for_relay(const char *raw_msg, uint8_t ttl, int8_t snr, uint8_t sf) {
     /* Don't relay if TTL is 0 or not present */
     if (ttl == 0) {
         return 0;  /* Message end-of-life, don't relay */
@@ -278,7 +284,7 @@ static int queue_for_relay(const char *raw_msg, uint8_t ttl, int8_t snr, uint8_t
     relay_msg_t *relay_msg = &relay_queue[relay_queue_count];
     strncpy(relay_msg->raw_msg, raw_msg, sizeof(relay_msg->raw_msg) - 1);
     relay_msg->raw_msg[sizeof(relay_msg->raw_msg) - 1] = '\0';
-    relay_msg->relay_delay_ms = calculate_relay_delay(snr, sf, bw);
+    relay_msg->relay_delay_ms = calculate_relay_delay(snr, sf);
     relay_msg->ttl = ttl - 1;  /* Decrement TTL */
     relay_msg->snr = snr;
     relay_msg->queued_at_ms = xtimer_now_usec() / 1000;  /* Timestamp in ms */
@@ -534,6 +540,14 @@ int listen_cmd(int argc, char **argv)
     (void)argv;
 
     netdev_t *netdev = &sx127x.netdev;
+    netopt_state_t current_state;
+    
+    /* Check if radio is currently busy transmitting */
+    netdev->driver->get(netdev, NETOPT_STATE, &current_state, sizeof(current_state));
+    if (current_state == NETOPT_STATE_TX) {
+        puts("₍ᐢ֎ﻌ֍ᐢ₎ʃ Radio is busy transmitting! Cannot switch to listen mode yet.");
+        return -1;
+    }
     /* Switch to continuous listen mode */
     const netopt_enable_t single = false;
 
@@ -731,7 +745,7 @@ static void handle_rdv_received(const char *sender, uint16_t msg_id, const char 
     /* Parse: RDV <frequency> <SFXBWY>
      * Example: RDV 868100000 SF7BW125
      */
-    char payload_copy[128];
+    static char payload_copy[128];
     strncpy(payload_copy, payload, sizeof(payload_copy) - 1);
     payload_copy[sizeof(payload_copy) - 1] = '\0';
 
@@ -749,17 +763,83 @@ static void handle_rdv_received(const char *sender, uint16_t msg_id, const char 
 
     uint32_t frequency = (uint32_t)atol(freq_str);
 
-    printf("\n✈️  [RDV] RENDEZVOUS from node %s (msg %u)\n", sender, msg_id);
-    printf("    Frequency: %lu Hz (%.1f MHz)\n", frequency, frequency / 1000000.0);
-    printf("    Configuration: %s\n", sf_bw_str);
-    printf("    → TODO: Switch to freq %s with %s\n", freq_str, sf_bw_str);
+    /* Parse SF and BW from the string (e.g., "SF7BW125") */
+    int sf_val = 0, bw_val = 0;
+    if (sscanf(sf_bw_str, "SF%dBW%d", &sf_val, &bw_val) == 2) {
+        uint8_t lora_bw;
+        switch(bw_val) {
+            case 125: lora_bw = LORA_BW_125_KHZ; break;
+            case 250: lora_bw = LORA_BW_250_KHZ; break;
+            case 500: lora_bw = LORA_BW_500_KHZ; break;
+            default:
+                printf("[RDV] ERROR: Invalid Bandwidth %d. Use 125, 250, or 500.\n", bw_val);
+                return;
+        }
+        
+        if (sf_val < 7 || sf_val > 12) {
+            printf("[RDV] ERROR: Invalid Spreading Factor %d. Use 7 to 12.\n", sf_val);
+            return;
+        }
+
+        /* Save to pending state */
+        pending_rdv_freq = frequency;
+        pending_rdv_sf = (uint8_t)sf_val;
+        pending_rdv_bw = lora_bw;
+        pending_rdv_valid = 1;
+
+        printf("\n[RDV] RENDEZVOUS from node %s (msg %u)\n", sender, msg_id);
+        printf("    Frequency: %lu Hz (%.1f MHz)\n", frequency, frequency / 1000000.0);
+        printf("    Configuration: %s\n", sf_bw_str);
+        printf("    → Type 'apply_rdv' to switch to these parameters.\n");
+    } else {
+        printf("[RDV] ERROR: Failed to parse configuration %s\n", sf_bw_str);
+    }
+}
+
+int apply_rdv_cmd(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    if (!pending_rdv_valid) {
+        puts("No pending RDV parameters to apply. Wait for an RDV message first.");
+        return -1;
+    }
+
+    netdev_t *netdev = &sx127x.netdev;
+
+    /* Apply Frequency */
+    netdev->driver->set(netdev, NETOPT_CHANNEL_FREQUENCY, 
+                        &pending_rdv_freq, sizeof(pending_rdv_freq));
+    
+    /* Apply Spreading Factor */
+    netdev->driver->set(netdev, NETOPT_SPREADING_FACTOR, 
+                        &pending_rdv_sf, sizeof(pending_rdv_sf));
+    
+    /* Apply Bandwidth */
+    netdev->driver->set(netdev, NETOPT_BANDWIDTH, 
+                        &pending_rdv_bw, sizeof(pending_rdv_bw));
+
+    printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ Success! Switched radio to:\n");
+    printf(" - Frequency: %lu Hz\n", pending_rdv_freq);
+    printf(" - SF: %u\n", pending_rdv_sf);
+    
+    /* Determine human-readable bandwidth for print */
+    int bw_print = 125;
+    if (pending_rdv_bw == LORA_BW_250_KHZ) bw_print = 250;
+    if (pending_rdv_bw == LORA_BW_500_KHZ) bw_print = 500;
+    printf(" - BW: %d kHz\n", bw_print);
+
+    /* Invalidate the pending state so it can't be applied twice accidentally */
+    pending_rdv_valid = 0;
+
+    return 0;
 }
 
 static void handle_sos_received(const char *sender, uint16_t msg_id, const char *payload) {
     /* Parse: sos<latitude>,<longitude>
      * Example: sos3.86292,11.50003
      */
-    char payload_copy[128];
+    static char payload_copy[128];
     strncpy(payload_copy, payload, sizeof(payload_copy) - 1);
     payload_copy[sizeof(payload_copy) - 1] = '\0';
 
@@ -797,7 +877,7 @@ static void handle_lpp_received(const char *sender, uint16_t msg_id, const char 
      * 1. lpp<hex> - pre-formatted LPP Cayenne payload
      * 2. lpp     - SAUL sensor request confirmation
      */
-    char payload_copy[256];
+    static char payload_copy[256];
     strncpy(payload_copy, payload, sizeof(payload_copy) - 1);
     payload_copy[sizeof(payload_copy) - 1] = '\0';
 
@@ -827,7 +907,7 @@ static void handle_lpp_received(const char *sender, uint16_t msg_id, const char 
     printf("      - And other sensor readings\n");
 }
 
-static void handle_chat_message(char *raw_msg, int8_t snr, uint8_t sf, uint8_t bw) {
+static void handle_chat_message(char *raw_msg, int8_t snr, uint8_t sf){
     /*
      Copie de travail pour ne pas altérer le buffer original si besoin 
     char chat_buf[255];
@@ -879,7 +959,7 @@ static void handle_chat_message(char *raw_msg, int8_t snr, uint8_t sf, uint8_t b
     }
         */
 
-    char chat_buf[255];
+    static char chat_buf[255];
     strncpy(chat_buf, raw_msg, sizeof(chat_buf) - 1);
     chat_buf[254] = '\0';
 
@@ -910,49 +990,81 @@ static void handle_chat_message(char *raw_msg, int8_t snr, uint8_t sf, uint8_t b
     *colon1 = '\0';
     char *after_target = colon1 + 1;
 
-    /* 3. Parse msg_id,ttl:payload format
-     *    Format: <msg_id>,<ttl>:<payload>
-     *    Example: 42,7:Hello world */
-    
+    /* 3. Parse msg_id and optional ttl
+    *    With TTL:    <msg_id>,<ttl>:<payload>
+    *    Without TTL: <msg_id>:<payload>
+    */
+
+    uint16_t msg_id;
+    uint8_t ttl = 2;  /* fallback if TTL is omitted */
+
+    char *colon2 = strchr(after_target, ':');
+    if (!colon2) {
+        printf("[DEBUG]3: LEAVING!\n");
+        return;
+    }
+
     char *comma = strchr(after_target, ',');
-    if (!comma) return;
-    *comma = '\0';
-    
-    uint16_t msg_id = (uint16_t)atoi(after_target);
-    
-    char *after_msg_id = comma + 1;
-    char *colon2 = strchr(after_msg_id, ':');
-    if (!colon2) return;
+    if (comma && comma < colon2) {
+        /* TTL is present: msg_id,ttl:payload */
+        *comma = '\0';
+        msg_id = (uint16_t)atoi(after_target);
+        *colon2 = '\0';
+        ttl = (uint8_t)atoi(comma + 1);
+    } else {
+    /* TTL is absent: msg_id:payload */
     *colon2 = '\0';
-    
-    uint8_t ttl = (uint8_t)atoi(after_msg_id);
+    msg_id = (uint16_t)atoi(after_target);
+    }
+
     char *payload = colon2 + 1;
+
+
+    /* -------------------------------------------------- *
+     * Filter: Is this message intended for me?
+     * -------------------------------------------------- */
+    int is_for_me = 0;
+    
+    if (type == '#') {
+        /* Salon message: check if we are in this salon */
+        if (is_in_salon(target)) {
+            is_for_me = 1;
+        }
+    } else if (type == '@') {
+        /* Direct or Broadcast message */
+        if (target[0] == '\0' || strcmp(target, "*") == 0 || strcmp(target, MY_NODE_ID) == 0) {
+            is_for_me = 1;
+        }
+    }
 
     /* -------------------------------------------------- *
      * Node table — update as soon as we have a valid frame
      * (do this regardless of whether we display or react)
      * -------------------------------------------------- */
-    if (sender[0] != '\0') {
+    if (sender[0] != '\0' && is_for_me) {
         node_table_update(sender, msg_id);
     }
 
+
     /* -------------------------------------------------- *
-     * Display with SNR and TTL info
+     * Display with SNR and TTL info (only if intended for me)
      * -------------------------------------------------- */
-    printf("\n₍ᐢ֎ﻌ֍ᐢ₎ʃ [LoRaChat] De: %s | Pour: %c%s | ID: %u | TTL: %u | SNR: %d dB\n> %s\n",
-           sender, type, target, msg_id, ttl, snr, payload ? payload : "[payload unavailable]");
+    if (is_for_me) {
+        printf("\n₍ᐢ֎ﻌ֍ᐢ₎ʃ [LoRaChat] De: %s | Pour: %c%s | ID: %u | TTL: %u | SNR: %d dB\n> %s\n",
+               sender, type, target, msg_id, ttl, snr, payload ? payload : "[payload unavailable]");
+    }
 
      /* -------------------------------------------------- *
      * Relay Management: Queue message if TTL > 0 and not from us
      * -------------------------------------------------- */
     if (strcmp(sender, MY_NODE_ID) != 0) {
         /* Check if we should relay this message */
-        int relay_result = queue_for_relay(raw_msg, ttl, snr, sf, bw);
+        int relay_result = queue_for_relay(raw_msg, ttl, snr, sf);
         msg_status_t status = (relay_result > 0) ? MSG_STATUS_RELAYED : 
                              (relay_result == 0) ? MSG_STATUS_NOT_RELAYED : MSG_STATUS_DROPPED;
         
         /* Add to history with relay status */
-        if (payload != NULL) {
+        if (payload != NULL && is_for_me) {
             add_to_history(sender, type, target, payload, msg_id, ttl, snr, status);
         }
     }
@@ -962,31 +1074,33 @@ static void handle_chat_message(char *raw_msg, int8_t snr, uint8_t sf, uint8_t b
     if (strcmp(sender, MY_NODE_ID) == 0) return;
 
     if (payload == NULL || payload[0] == '\0') return;
+    if (is_for_me)
+        {
+        /* Rule 1: ping */
+        if (strcmp(payload, "Qui est la?") == 0) {
+            printf("[LoRaChat] -> Ping received, preparing response...\n");
 
-    /* Rule 1: ping */
-    if (strcmp(payload, "Qui est la?") == 0) {
-        printf("[LoRaChat] -> Ping received, preparing response...\n");
+            static char reply[255];
+            snprintf(reply, sizeof(reply), "%s@%.32s:%u,%d:Je suis la !",
+                    MY_NODE_ID, sender, current_msg_id++, CHAT_TTL_DEFAULT);
 
-        char reply[512];
-        snprintf(reply, sizeof(reply), "%s@%s:%u,%d:Je suis la !",
-                 MY_NODE_ID, sender, current_msg_id++, CHAT_TTL_DEFAULT);
-
-        iolist_t iolist = { .iol_base = reply, .iol_len = strlen(reply) + 1 };
-        netdev_t *netdev = &sx127x.netdev;
-        netdev->driver->send(netdev, &iolist);
-        printf("[LoRaChat] -> Response sent: %s\n", reply);
-    }
-    /* Rule 2: RDV (Rendezvous/Frequency hop) */
-    else if (strncmp(payload, "RDV ", 4) == 0) {
-        handle_rdv_received(sender, msg_id, payload);
-    }
-    /* Rule 3: SOS (Distress signal with coordinates) */
-    else if (strncmp(payload, "sos", 3) == 0) {
-        handle_sos_received(sender, msg_id, payload);
-    }
-    /* Rule 4: LPP Telemetry (Cayenne Low Power Payload) */
-    else if (strncmp(payload, "lpp", 3) == 0) {
-        handle_lpp_received(sender, msg_id, payload);
+            iolist_t iolist = { .iol_base = reply, .iol_len = strlen(reply) + 1 };
+            netdev_t *netdev = &sx127x.netdev;
+            netdev->driver->send(netdev, &iolist);
+            printf("[LoRaChat] -> Response sent: %s\n", reply);
+        }
+        /* Rule 2: RDV (Rendezvous/Frequency hop) */
+        else if (strncmp(payload, "RDV ", 4) == 0) {
+            handle_rdv_received(sender, msg_id, payload);
+        }
+        /* Rule 3: SOS (Distress signal with coordinates) */
+        else if (strncmp(payload, "sos", 3) == 0) {
+            handle_sos_received(sender, msg_id, payload);
+        }
+        /* Rule 4: LPP Telemetry (Cayenne Low Power Payload) */
+        else if (strncmp(payload, "lpp", 3) == 0) {
+            handle_lpp_received(sender, msg_id, payload);
+        }
     }
 }
 
@@ -1008,7 +1122,8 @@ int chat_cmd(int argc, char **argv) {
 
     /* --- Parse optional keyword args and collect payload --- */
     int ttl = CHAT_TTL_DEFAULT;
-    char payload[256] = {0};
+    static char payload[256] = {0};
+    payload[0] = '\0';
     int msg_type = 0;  /* 0=normal, 1=RDV, 2=SOS, 3=LPP */
 
     for (int i = 2; i < argc; i++) {
@@ -1027,7 +1142,8 @@ int chat_cmd(int argc, char **argv) {
     }
 
     /* --- Detect and parse special message types --- */
-    char formatted_payload[256] = {0};
+    static char formatted_payload[256] = {0};
+    formatted_payload[0] = '\0';
 
     if (strncmp(payload, "RDV ", 4) == 0) {
         /* RDV <frequency> <SFXBWY> */
@@ -1156,7 +1272,7 @@ int chat_cmd(int argc, char **argv) {
      * Format: <emitter><type><target>:<msg_id>,<ttl>:<payload>
      * Example: 6767@node1:42,7:RDV 868100000 SF7BW125
      */
-    char chat_buf[CHAT_BUF_SIZE];
+    static char chat_buf[CHAT_BUF_SIZE];
     int len = snprintf(chat_buf, sizeof(chat_buf),
                        "%s%s%s:%u,%d:%s",
                        MY_NODE_ID,
@@ -1260,12 +1376,15 @@ static void _event_cb(netdev_t *dev, netdev_event_t event)
             netdev->driver->get(netdev, NETOPT_BANDWIDTH, &bw, sizeof(bw));
 
             /* Appel de notre analyseur LoRaChat avec SNR, SF, BW pour relay management */
-            handle_chat_message(message, (int8_t)packet_info.snr, sf, bw);
+            handle_chat_message(message, (int8_t)packet_info.snr, sf);
             break;
 
         case NETDEV_EVENT_TX_COMPLETE:
-            sx127x_set_sleep(&sx127x);
-            puts("Transmission completed");
+            puts("Transmission completed. Auto-switching to Listen mode...");
+            
+            
+            netopt_state_t state = NETOPT_STATE_RX;
+            dev->driver->set(dev, NETOPT_STATE, &state, sizeof(state));
             break;
 
         case NETDEV_EVENT_CAD_DONE:
@@ -1386,8 +1505,8 @@ void *_relay_thread(void *arg) {
                        time_elapsed, msg->ttl);
                 
                 /* Reconstruct message with new TTL */
-                char modified_msg[255];
-                char msg_copy[255];
+                static char modified_msg[255];
+                static char msg_copy[255];
                 strncpy(msg_copy, msg->raw_msg, sizeof(msg_copy) - 1);
                 msg_copy[sizeof(msg_copy) - 1] = '\0';
                 
@@ -1658,13 +1777,13 @@ int history_cmd(int argc, char **argv) {
          const char *status_str;
         switch (msg_history[index].status) {
             case MSG_STATUS_RELAYED:
-                status_str = "✓RELAYED";
+                status_str = "RELAYED";
                 break;
             case MSG_STATUS_NOT_RELAYED:
-                status_str = "✗NO_RELAY";
+                status_str = "NO_RELAY";
                 break;
             case MSG_STATUS_DROPPED:
-                status_str = "⊘DROP";
+                status_str = "DROP";
                 break;
             default:
                 status_str = "?UNKNOWN";
@@ -1784,6 +1903,7 @@ static const shell_command_t shell_commands[] = {
     { "history",    "Show last received messages (FIFO)",      history_cmd },
     { "snr_threshold", "Get/Set SNR threshold for relay",     snr_threshold_cmd },
     { "relayq",   "Show relay queue status and settings",   relayq_cmd },
+    { "apply_rdv",    "Switch radio to the last received RDV",   apply_rdv_cmd },
     { NULL, NULL, NULL }
 };
 
