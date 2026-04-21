@@ -258,19 +258,6 @@ Relay status values: `RELAYED`, `NO_RELAY`, `DROP`.
 
 ---
 
-## Persistence (EEPROM)
-
-The node table is automatically saved to EEPROM whenever it is updated, and restored on boot. Checksum validation protects against corrupted data.
-
-### `forget`
-Wipe the persisted node table from EEPROM (factory reset of known nodes).
-
-```
-> forget
-```
-
----
-
 ## Radio Diagnostics
 
 ### `random`
