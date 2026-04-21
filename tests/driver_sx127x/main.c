@@ -883,7 +883,7 @@ static void handle_lpp_received(const char *sender, uint16_t msg_id, const char 
 
     char *lpp_data = payload_copy + 3;  /* skip "lpp" */
 
-    printf("\n📊 [TELEMETRY] LPP Cayenne from node %s (msg %u)\n", sender, msg_id);
+    printf("\n [TELEMETRY] LPP Cayenne from node %s (msg %u)\n", sender, msg_id);
 
     if (*lpp_data == '\0') {
         /* Request for SAUL sensor reading */
@@ -1264,7 +1264,7 @@ int chat_cmd(int argc, char **argv) {
     }
 
     if (strcmp(type, "#") == 0 && !is_in_salon(target)){
-        printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ [Erreur] Cannot send: You are not a member of salon #%s. Use 'join %s' first.\n", target, target);
+        printf("₍ᐢ֎ﻌ֍ᐢ₎ʃ [Error] Cannot send: You are not a member of salon #%s. Use 'join %s' first.\n", target, target);
         return -1; // drop message
     }
 
