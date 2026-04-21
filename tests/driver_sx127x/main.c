@@ -47,7 +47,6 @@
 #include "saul_reg.h"
 #include "xtimer.h"
 
-
 #define SX127X_LORA_MSG_QUEUE   (16U)
 #ifndef SX127X_STACKSIZE
 #define SX127X_STACKSIZE        (THREAD_STACKSIZE_DEFAULT + 1024)
@@ -81,8 +80,101 @@ static uint32_t telemetry_interval = 0; /* 0 means disabled */
 typedef struct {
     char     node_id[NODE_ID_MAXLEN];  /* emitter string, e.g. "NODE1"  */
     uint16_t last_msg_id;              /* last sequence number seen      */
+    uint32_t last_seen_ms;   /* xtimer timestamp of last received message */
     uint8_t  active;                   /* 0 = slot free                  */
 } known_node_t;
+
+#include "periph/eeprom.h"
+
+/* ================================================== *
+ * EEPROM PERSISTENCE - Node Table
+ * ================================================== */
+
+#define EEPROM_MAGIC          0xCAFE
+#define EEPROM_BASE_ADDR      0x0000
+
+/* On-disk layout header */
+typedef struct {
+    uint16_t magic;
+    uint16_t checksum;
+} eeprom_header_t;
+
+#define EEPROM_HEADER_SIZE    sizeof(eeprom_header_t)
+#define EEPROM_TABLE_ADDR     (EEPROM_BASE_ADDR + EEPROM_HEADER_SIZE)
+
+/* Simple XOR checksum over the entire node table */
+static uint16_t _compute_checksum(void) {
+    uint16_t crc = 0;
+    const uint8_t *p = (const uint8_t *)node_table;
+    for (size_t i = 0; i < sizeof(node_table); i++) {
+        crc ^= p[i];
+        crc = (crc << 1) | (crc >> 15);  /* rotate left 1 bit */
+    }
+    return crc;
+}
+
+/* Write the full node table to EEPROM (call after any mutation) */
+void eeprom_save_nodes(void) {
+    /* Write table data first */
+    eeprom_write(EEPROM_TABLE_ADDR,
+                 (const uint8_t *)node_table,
+                 sizeof(node_table));
+
+    /* Write header with fresh checksum */
+    eeprom_header_t hdr = {
+        .magic    = EEPROM_MAGIC,
+        .checksum = _compute_checksum(),
+    };
+    eeprom_write(EEPROM_BASE_ADDR,
+                 (const uint8_t *)&hdr,
+                 sizeof(hdr));
+
+    puts("[EEPROM] Node table saved.");
+}
+
+/* Load node table from EEPROM on boot.
+ * Returns 1 if valid data was restored, 0 on first boot or corruption. */
+int eeprom_load_nodes(void) {
+    eeprom_header_t hdr;
+    eeprom_read(EEPROM_BASE_ADDR, (uint8_t *)&hdr, sizeof(hdr));
+
+    if (hdr.magic != EEPROM_MAGIC) {
+        puts("[EEPROM] No valid data found (first boot or erased). Starting fresh.");
+        return 0;
+    }
+
+    /* Load the table tentatively */
+    eeprom_read(EEPROM_TABLE_ADDR,
+                (uint8_t *)node_table,
+                sizeof(node_table));
+
+    /* Verify integrity */
+    uint16_t actual_crc = _compute_checksum();
+    if (actual_crc != hdr.checksum) {
+        printf("[EEPROM] Checksum mismatch (stored=0x%04X, computed=0x%04X). "
+               "Discarding corrupted data.\n",
+               hdr.checksum, actual_crc);
+        memset(node_table, 0, sizeof(node_table));  /* safe reset */
+        return 0;
+    }
+
+    /* Count restored entries for feedback */
+    int count = 0;
+    for (int i = 0; i < NODE_TABLE_SIZE; i++) {
+        if (node_table[i].active) count++;
+    }
+    printf("[EEPROM] Restored %d node(s) from persistent storage.\n", count);
+    return 1;
+}
+
+/* Wipe EEPROM node table (useful for factory reset) */
+void eeprom_clear_nodes(void) {
+    memset(node_table, 0, sizeof(node_table));
+    uint8_t zero = 0;
+    /* Overwrite magic to invalidate header */
+    eeprom_write(EEPROM_BASE_ADDR, &zero, 1);
+    puts("[EEPROM] Node table cleared.");
+}
 
 
 known_node_t node_table[NODE_TABLE_SIZE] = {0};
@@ -90,6 +182,7 @@ known_node_t node_table[NODE_TABLE_SIZE] = {0};
 void node_table_update(const char *emitter_id, uint16_t msg_id)
 {
     int free_slot = -1;
+    uint32_t now_ms = xtimer_now_usec() / 1000;
 
     for (int i = 0; i < NODE_TABLE_SIZE; i++) {
         if (!node_table[i].active) {
@@ -99,6 +192,8 @@ void node_table_update(const char *emitter_id, uint16_t msg_id)
         if (strncmp(node_table[i].node_id, emitter_id, NODE_ID_MAXLEN) == 0) {
             /* Known node — update in place */
             node_table[i].last_msg_id  = msg_id;
+            node_table[i].last_seen_ms = now_ms;
+            eeprom_save_nodes();
             return;
         }
     }
@@ -111,7 +206,9 @@ void node_table_update(const char *emitter_id, uint16_t msg_id)
     strncpy(node_table[free_slot].node_id, emitter_id, NODE_ID_MAXLEN - 1);
     node_table[free_slot].node_id[NODE_ID_MAXLEN - 1] = '\0';
     node_table[free_slot].last_msg_id = msg_id;
-    node_table[free_slot].active      = 1;
+    node_table[free_slot].last_seen_ms = now_ms;
+    node_table[free_slot].active = 1;
+    eeprom_save_nodes();
 }
 
 #define MAX_SALONS         5
@@ -1672,9 +1769,10 @@ int nodes_cmd(int argc, char **argv)
         }
 
         any = 1;
-        printf(" - %s : %u\n",
+        printf(" - %s : %u | Last seen: %lu ms ago...\n",
                node_table[i].node_id,
-               (unsigned)node_table[i].last_msg_id);
+               (unsigned)node_table[i].last_msg_id,
+            (unsigned long)((xtimer_now_usec()/1000) - node_table[i].last_seen_ms));
     }
 
     if (!any) {
@@ -1807,6 +1905,14 @@ int history_cmd(int argc, char **argv) {
     return 0;
 }
 
+
+int forget_cmd(int argc, char **argv) {
+    (void)argc; (void)argv;
+    eeprom_clear_nodes();
+    puts("₍ᐢ֎ﻌ֍ᐢ₎ʃ Node table wiped from EEPROM.");
+    return 0;
+}
+
 int snr_threshold_cmd(int argc, char **argv) {
     /* Get/Set SNR threshold for relay filtering
      * usage: snr_threshold [get|set <value>]
@@ -1901,6 +2007,7 @@ static const shell_command_t shell_commands[] = {
     { "salons",   "List joined salons",                     salons_cmd },
     { "autotelm",   "Set auto telemetry interval (0 to stop)", autotelm_cmd },
     { "history",    "Show last received messages (FIFO)",      history_cmd },
+    {"forget", "Wipe persistent memory from EEPROM", forget_cmd},
     { "snr_threshold", "Get/Set SNR threshold for relay",     snr_threshold_cmd },
     { "relayq",   "Show relay queue status and settings",   relayq_cmd },
     { "apply_rdv",    "Switch radio to the last received RDV",   apply_rdv_cmd },
@@ -1911,6 +2018,7 @@ int main(void) {
 
     //init_sx1272_cmd(0,NULL);
 
+    eeprom_load_nodes(); /*Before shell starts...*/
     /* start the shell */
     puts("Initialization successful - starting the shell now");
     char line_buf[SHELL_DEFAULT_BUFSIZE];
